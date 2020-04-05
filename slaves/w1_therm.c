@@ -19,25 +19,16 @@
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
  */
 
-#include <asm/types.h>
-
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/sched.h>
-#include <linux/device.h>
-#include <linux/types.h>
 #include <linux/slab.h>
 #include <linux/delay.h>
 #include <linux/hwmon.h>
+#include <linux/string.h>
 
-#include <linux/w1.h>
-
-#define W1_THERM_DS18S20	0x10
-#define W1_THERM_DS1822		0x22
-#define W1_THERM_DS18B20	0x28
-#define W1_THERM_DS1825		0x3B
-#define W1_THERM_DS28EA00	0x42
+#include "w1_therm.h"
 
 /* Allow the strong pullup to be disabled, but default to enabled.
  * If it was disabled a parasite powered device might not get the require
@@ -55,63 +46,42 @@
 static int w1_strong_pullup = 1;
 module_param_named(strong_pullup, w1_strong_pullup, int, 0);
 
-struct w1_therm_family_data {
-	uint8_t rom[9];
-	atomic_t refcnt;
-};
 
-struct therm_info {
-	u8 rom[9];
-	u8 crc;
-	u8 verdict;
-};
-
-/* return the address of the refcnt in the family data */
-#define THERM_REFCNT(family_data) \
-	(&((struct w1_therm_family_data *)family_data)->refcnt)
-
-static int w1_therm_add_slave(struct w1_slave *sl)
-{
-	sl->family_data = kzalloc(sizeof(struct w1_therm_family_data),
-		GFP_KERNEL);
-	if (!sl->family_data)
-		return -ENOMEM;
-	atomic_set(THERM_REFCNT(sl->family_data), 1);
-	return 0;
-}
-
-static void w1_therm_remove_slave(struct w1_slave *sl)
-{
-	int refcnt = atomic_sub_return(1, THERM_REFCNT(sl->family_data));
-
-	while (refcnt) {
-		msleep(1000);
-		refcnt = atomic_read(THERM_REFCNT(sl->family_data));
-	}
-	kfree(sl->family_data);
-	sl->family_data = NULL;
-}
-
-static ssize_t w1_slave_show(struct device *device,
-	struct device_attribute *attr, char *buf);
-
-static ssize_t w1_slave_store(struct device *device,
-	struct device_attribute *attr, const char *buf, size_t size);
-
-static ssize_t w1_seq_show(struct device *device,
-	struct device_attribute *attr, char *buf);
-
-static DEVICE_ATTR_RW(w1_slave);
-static DEVICE_ATTR_RO(w1_seq);
+/*
+ * sysfile interface:
+ * w1_slave TODO fill
+ * temperature (RO):
+ *	. temperature in 1/1000 °
+ *
+ * ext_power (RO):
+ *	. -xx : xx is kernel error refer to /usr/include/asm/errno.h
+ *	. 0 : device parasite powered
+ *	. 1 : device externally powered
+ *
+ * resolution (RW):
+ *	. -xx 	: xx is kernel error refer to /usr/include/asm/errno.h
+ *	. 9..12 : resolution set in bit (or resolution to set in bit)
+ *	
+ * eeprom (WO): be aware that eeprom writing cycles count is limited
+ *	. 'write'	:	save device RAM to EEPROM
+ *	. 'read'	:	restore EEPROM data in device RAM 
+ *				(device do that automatically on power-up)
+ *
+*/ 
 
 static struct attribute *w1_therm_attrs[] = {
 	&dev_attr_w1_slave.attr,
+	&dev_attr_temperature.attr,	
+	&dev_attr_ext_power.attr,
+	&dev_attr_resolution.attr,	
+	&dev_attr_eeprom.attr,
 	NULL,
 };
 
 static struct attribute *w1_ds28ea00_attrs[] = {
 	&dev_attr_w1_slave.attr,
 	&dev_attr_w1_seq.attr,
+	&dev_attr_ext_power.attr,	//ASH
 	NULL,
 };
 
@@ -213,15 +183,20 @@ struct w1_therm_family_converter {
 	struct w1_family	*f;
 	int			(*convert)(u8 rom[9]);
 	int			(*precision)(struct device *device, int val);
+	int			(*set_resolution)(struct w1_slave *sl, int val);
+	int			(*get_resolution)(struct w1_slave *sl);
 	int			(*eeprom)(struct device *device);
 };
 
 /* write configuration to eeprom */
 static inline int w1_therm_eeprom(struct device *device);
 
-/* Set precision for conversion */
+/* TODO del the precision Set precision for conversion */
 static inline int w1_DS18B20_precision(struct device *device, int val);
 static inline int w1_DS18S20_precision(struct device *device, int val);
+
+
+
 
 /* The return value is millidegrees Centigrade. */
 static inline int w1_DS18B20_convert_temp(u8 rom[9]);
@@ -229,36 +204,107 @@ static inline int w1_DS18S20_convert_temp(u8 rom[9]);
 
 static struct w1_therm_family_converter w1_therm_families[] = {
 	{
-		.f		= &w1_therm_family_DS18S20,
-		.convert	= w1_DS18S20_convert_temp,
-		.precision	= w1_DS18S20_precision,
-		.eeprom		= w1_therm_eeprom
+		.f				= &w1_therm_family_DS18S20,
+		.convert		= w1_DS18S20_convert_temp,
+		.precision		= w1_DS18S20_precision,
+		.set_resolution	= w1_DS18S20_set_resolution,
+		.get_resolution	= w1_DS18S20_get_resolution,
+		.eeprom			= w1_therm_eeprom
 	},
 	{
-		.f		= &w1_therm_family_DS1822,
-		.convert	= w1_DS18B20_convert_temp,
-		.precision	= w1_DS18S20_precision,
-		.eeprom		= w1_therm_eeprom
+		.f				= &w1_therm_family_DS1822,
+		.convert		= w1_DS18B20_convert_temp,
+		.precision		= w1_DS18S20_precision,
+		.set_resolution	= w1_DS18S20_set_resolution,
+		.get_resolution	= w1_DS18S20_get_resolution,
+		.eeprom			= w1_therm_eeprom
 	},
 	{
-		.f		= &w1_therm_family_DS18B20,
-		.convert	= w1_DS18B20_convert_temp,
-		.precision	= w1_DS18B20_precision,
-		.eeprom		= w1_therm_eeprom
+		.f				= &w1_therm_family_DS18B20,
+		.convert		= w1_DS18B20_convert_temp,
+		.precision		= w1_DS18B20_precision,
+		.set_resolution	= w1_DS18B20_set_resolution,
+		.get_resolution	= w1_DS18B20_get_resolution,
+		.eeprom			= w1_therm_eeprom
 	},
 	{
-		.f		= &w1_therm_family_DS28EA00,
-		.convert	= w1_DS18B20_convert_temp,
-		.precision	= w1_DS18S20_precision,
-		.eeprom		= w1_therm_eeprom
+		.f				= &w1_therm_family_DS28EA00,
+		.convert		= w1_DS18B20_convert_temp,
+		.precision		= w1_DS18S20_precision,
+		.set_resolution	= w1_DS18S20_set_resolution,
+		.get_resolution	= w1_DS18S20_get_resolution,
+		.eeprom			= w1_therm_eeprom
 	},
 	{
-		.f		= &w1_therm_family_DS1825,
-		.convert	= w1_DS18B20_convert_temp,
-		.precision	= w1_DS18S20_precision,
-		.eeprom		= w1_therm_eeprom
+		.f				= &w1_therm_family_DS1825,
+		.convert		= w1_DS18B20_convert_temp,
+		.precision		= w1_DS18S20_precision,
+		.set_resolution	= w1_DS18S20_set_resolution,
+		.get_resolution	= w1_DS18S20_get_resolution,
+		.eeprom			= w1_therm_eeprom
 	}
 };
+/*  device_family() 
+ *  @brief Helper function that provide a pointer on the w1_therm_family_converter struct
+ *  @param sl represents the device 
+ *  @return pointer to the slaves's family converter, NULL if not known
+*/
+static struct w1_therm_family_converter *device_family(struct w1_slave *sl)
+{
+	struct w1_therm_family_converter *ret = NULL;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(w1_therm_families); ++i) {
+		if (w1_therm_families[i].f->fid == sl->family->fid) {
+				ret = &w1_therm_families[i];
+			break;
+		}
+	}
+	return ret;
+}
+
+static int w1_therm_add_slave(struct w1_slave *sl)
+{
+	sl->family_data = kzalloc(sizeof(struct w1_therm_family_data),
+		GFP_KERNEL);
+	if (!sl->family_data)
+		return -ENOMEM;
+	atomic_set(THERM_REFCNT(sl->family_data), 1);
+
+	/* Getting the power mode of the device {external, parasite}*/
+	SLAVE_POWERMODE(sl) = read_powermode(sl);
+
+	if ( SLAVE_POWERMODE(sl) < 0)
+	{	/* no error returned because device has been added, put a non*/
+		dev_warn(&sl->dev,
+			"Device has been added, but power_mode may be corrupted. err=%d\n",
+			SLAVE_POWERMODE(sl));
+	}
+
+	/* Getting the resolution of the device */
+	SLAVE_RESOLUTION(sl) = device_family(sl)->get_resolution(sl);
+
+	if ( SLAVE_RESOLUTION(sl) < 0)
+	{	/* no error returned because device has been added, put a non*/
+		dev_warn(&sl->dev,
+			"Device has been added, but resolution may be corrupted. err=%d\n",
+			SLAVE_RESOLUTION(sl));
+	}
+
+	return 0;
+}
+
+static void w1_therm_remove_slave(struct w1_slave *sl)
+{
+	int refcnt = atomic_sub_return(1, THERM_REFCNT(sl->family_data));
+
+	while (refcnt) {
+		msleep(1000);
+		refcnt = atomic_read(THERM_REFCNT(sl->family_data));
+	}
+	kfree(sl->family_data);
+	sl->family_data = NULL;
+}
 
 static inline int w1_therm_eeprom(struct device *device)
 {
@@ -421,6 +467,79 @@ error:
 	return ret;
 }
 
+static inline int w1_DS18B20_set_resolution(struct w1_slave *sl, int val)
+{
+	int ret = -ENODEV;
+	u8 new_config_register[3];	/* array of data to be written */
+	struct therm_info info;
+
+	/* resolution of DS18B20 is in the range [9..12] bits */
+	if ( val < 9 || val > 12 )
+		return -EINVAL;
+
+	val -= 9; /* soustract 9 the lowest resolution in bit */
+	val = (val << 5); /* shift to position bit 5 & bit 6 */
+
+	/* Read the scratchpad to change only the required bits 
+	( bit5 & bit 6 from byte 4) */
+	ret = read_scratchpad( sl, &info );
+	if (!ret){
+		new_config_register[0] = info.rom[2];
+		new_config_register[1] = info.rom[3];
+		new_config_register[2] = (info.rom[4] & 0b10011111) | \
+					(u8) val; /* config register is byte 4 */
+	}
+	else
+		return ret;
+
+	/* Write data in the device RAM */
+	ret = write_scratchpad(sl, new_config_register);
+
+	return ret;
+}
+
+static inline int w1_DS18S20_set_resolution(struct w1_slave *sl, int val)
+{
+	// TODO implement 
+	return 0;
+}
+
+static inline int w1_DS18B20_get_resolution(struct w1_slave *sl)
+{
+	int ret = -ENODEV;
+	u8 config_register;
+	struct therm_info info;
+
+	ret = read_scratchpad( sl, &info );
+
+	if (!ret)	{
+		config_register = info.rom[4]; /* config register is byte 4 */
+		config_register &= 0b01100000; /* keep only bit 5 & 6 */
+		config_register = (config_register >> 5);	/* shift to get 0b00 to 0b11 => 0 to 3 */
+		config_register += 9; /* add 9 the lowest resolution in bit */
+		ret = (int) config_register;
+	}
+	
+	return ret;
+}
+
+
+static inline int w1_DS18S20_get_resolution(struct w1_slave *sl)
+{
+/* TODO Implement :
+Resolutions greater than 9 bits can be calculated using the data 
+from the temperature, COUNT REMAIN and COUNT PER °C registers 
+in the scratchpad. Note that the COUNT PER  °C  register  is  
+hard-wired  to  16  (10h).  After  reading  the  scratchpad,  
+the  TEMP_READ  value  is  obtained  by  truncating  the  0.5°C  bit  
+(bit  0)  from  the  temperature  data  (see Figure  4).  
+The  extended  resolution  temperature  can  then be calculated u
+sing the following equation:
+*/
+	
+	return 0;
+}
+
 static inline int w1_DS18B20_convert_temp(u8 rom[9])
 {
 	s16 t = le16_to_cpup((__le16 *)rom);
@@ -483,6 +602,346 @@ static ssize_t w1_slave_store(struct device *device,
 	}
 	return ret ? : size;
 }
+
+/*------------------------ Helpers Functions----------------------------*/
+
+static inline bool get_bus_mutex_lock(struct mutex *lock)
+{
+	int max_trying = W1_THERM_MAX_TRY;
+	/* try to acquire the mutex, if not, sleep retry_delay before retry) */
+	while(mutex_lock_interruptible(lock) != 0 && max_trying > 0 ){
+		unsigned long sleep_rem;
+		sleep_rem = msleep_interruptible(W1_THERM_RETRY_DELAY);
+		if (!sleep_rem)
+			max_trying--;
+	}
+
+	if (!max_trying)
+		return false;	/* Didn't acquire the bus mutex */
+
+	return true;
+}
+
+static inline int get_convertion_time(struct w1_slave *sl)
+{
+	// TODO Check the compatibility with other devices
+	int ret;
+	if (!sl->family_data)
+		return -ENODEV;	/* device unknown */
+	
+	switch( SLAVE_RESOLUTION(sl) ){
+		case 9:
+			ret = 95;
+			break;
+		case 10:
+			ret = 190;
+			break;
+		case 11:
+			ret = 375;
+			break;
+		case 12:	
+		default:
+			ret = 750;
+	}
+	return ret;
+}
+
+/*------------------------Hardware Functions--------------------------*/
+
+/* Safe version of reser_select_slave - avoid using the one in w_io.c */
+static int reset_select_slave(struct w1_slave *sl)
+{
+	u8 match[9] = { W1_MATCH_ROM, };
+	u64 rn = le64_to_cpu(*((u64*)&sl->reg_num));
+
+	if (w1_reset_bus(sl->master))
+		return -ENODEV;
+
+	memcpy(&match[1], &rn, 8);
+	w1_write_block(sl->master, match, 9);
+
+	return 0;
+}
+
+static int read_scratchpad(struct w1_slave *sl, struct therm_info *info)
+{
+	struct w1_master *dev_master = sl->master;
+	int max_trying = W1_THERM_MAX_TRY;
+	u8 ret = -ENODEV;
+	info->verdict = 0;
+
+	if (!sl->family_data) 
+		goto error;
+
+	memset(info->rom, 0, sizeof(info->rom));
+
+	/* prevent the slave from going away in sleep */
+	atomic_inc(THERM_REFCNT(sl->family_data));
+
+	if (!get_bus_mutex_lock (&dev_master->bus_mutex)){
+		ret = -EAGAIN;	// Didn't acquire the mutex
+		goto dec_refcnt;
+	}
+
+	while ( max_trying-- && ret ) { /* ret should be 0 */
+
+		if (!reset_select_slave(sl)) {	/* safe version to select slave */
+			u8 nb_bytes_read;
+			w1_write_8(dev_master, W1_READ_SCRATCHPAD);
+
+			nb_bytes_read = w1_read_block(dev_master, info->rom, 9);
+			if (nb_bytes_read != 9) {
+				dev_warn(&sl->dev, "w1_read_block() "
+					"returned %u instead of 9.\n",
+					nb_bytes_read);
+				ret = -EIO;
+			}
+
+			info->crc = w1_calc_crc8(info->rom, 8);
+
+			if (info->rom[8] == info->crc)
+			{
+				info->verdict = 1;
+				ret = 0;
+			}
+			else
+				ret = -EIO; /* CRC not checked */
+		}
+
+	}
+	mutex_unlock(&dev_master->bus_mutex);	
+
+dec_refcnt:
+	atomic_dec(THERM_REFCNT(sl->family_data));
+error:
+	return ret;
+}
+
+static int write_scratchpad(struct w1_slave *sl, const u8 *data)
+{
+	struct w1_master *dev_master = sl->master;
+	int max_trying = W1_THERM_MAX_TRY;
+	u8 ret = -ENODEV;
+
+	if (!sl->family_data) 
+		goto error;
+
+	/* prevent the slave from going away in sleep */
+	atomic_inc(THERM_REFCNT(sl->family_data));
+
+	if (!get_bus_mutex_lock (&dev_master->bus_mutex)){
+		ret = -EAGAIN;	// Didn't acquire the mutex
+		goto dec_refcnt;
+	}
+
+	while ( max_trying-- && ret ) { /* ret should be 0 */
+
+		if (!reset_select_slave(sl)) {	/* safe version to select slave */
+			w1_write_8(dev_master, W1_WRITE_SCRATCHPAD);
+			w1_write_block(dev_master, data, 3);
+			ret =0;
+		}
+	}
+	mutex_unlock(&dev_master->bus_mutex);	
+
+dec_refcnt:
+	atomic_dec(THERM_REFCNT(sl->family_data));
+error:
+	return ret;
+}
+
+static int convert_t(struct w1_slave *sl, struct therm_info *info)
+{
+	struct w1_master *dev_master = sl->master;
+	int max_trying = W1_THERM_MAX_TRY;
+	int t_conv, ret = -ENODEV;
+	bool strong_pullup;
+
+	if (!sl->family_data) 
+		goto error;
+	
+	t_conv = get_convertion_time(sl); /* conversion duration */
+	strong_pullup = (w1_strong_pullup == 2 ||
+					(!SLAVE_POWERMODE(sl) && w1_strong_pullup));
+
+	memset(info->rom, 0, sizeof(info->rom));
+
+	// prevent the slave from going away in sleep 
+	atomic_inc(THERM_REFCNT(sl->family_data));
+
+	if (!get_bus_mutex_lock (&dev_master->bus_mutex)){
+		ret = -EAGAIN;	// Didn't acquire the mutex
+		goto dec_refcnt;
+	}
+
+	while ( max_trying-- && ret ) { /* ret should be 0 */
+
+		info->verdict = 0;
+		info->crc = 0;
+
+		if (!reset_select_slave(sl)) {	/* safe version to select slave */
+			unsigned long sleep_rem;
+
+			/* 750ms strong pullup (or delay) after the convert */
+			if (strong_pullup)
+				w1_next_pullup(dev_master, t_conv);
+			
+			w1_write_8(dev_master, W1_CONVERT_TEMP);
+
+			if (strong_pullup) {
+				sleep_rem = msleep_interruptible(t_conv);
+				if (sleep_rem != 0) {
+					ret = -EINTR;
+					goto mt_unlock;
+				}
+				mutex_unlock(&dev_master->bus_mutex);
+			} else {
+				mutex_unlock(&dev_master->bus_mutex);
+
+				sleep_rem = msleep_interruptible(t_conv);
+				if (sleep_rem != 0) {
+					ret = -EINTR;
+					goto dec_refcnt;
+				}
+			}
+			ret = read_scratchpad( sl, info);
+		}
+
+	}
+
+mt_unlock:
+	mutex_unlock(&dev_master->bus_mutex);	
+dec_refcnt:
+	atomic_dec(THERM_REFCNT(sl->family_data));
+error:
+	return ret;
+}
+
+static int copy_scratchpad(struct w1_slave *sl)
+{
+	struct w1_master *dev_master = sl->master;
+	int max_trying = W1_THERM_MAX_TRY;
+	int t_write, ret = -ENODEV;
+	bool strong_pullup;
+
+	if (!sl->family_data) 
+		goto error;
+	
+	t_write = W1_THERM_EEPROM_WRITE_DELAY; // TODO change that define to func
+	strong_pullup = (w1_strong_pullup == 2 ||
+					(!SLAVE_POWERMODE(sl) && w1_strong_pullup));
+
+	// prevent the slave from going away in sleep 
+	atomic_inc(THERM_REFCNT(sl->family_data));
+
+	if (!get_bus_mutex_lock (&dev_master->bus_mutex)){
+		ret = -EAGAIN;	// Didn't acquire the mutex
+		goto dec_refcnt;
+	}
+
+	while ( max_trying-- && ret ) { /* ret should be 0 */
+
+		if (!reset_select_slave(sl)) {	/* safe version to select slave */
+			unsigned long sleep_rem;
+
+			/* 750ms strong pullup (or delay) after the convert */
+			if (strong_pullup)
+				w1_next_pullup(dev_master, t_write);
+			
+			w1_write_8(dev_master, W1_COPY_SCRATCHPAD);
+
+			if (strong_pullup) {
+				sleep_rem = msleep_interruptible(t_write);
+				if (sleep_rem != 0) {
+					ret = -EINTR;
+					goto mt_unlock;
+				}
+			} 
+			ret = 0;	
+		}
+
+	}
+
+mt_unlock:
+	mutex_unlock(&dev_master->bus_mutex);	
+dec_refcnt:
+	atomic_dec(THERM_REFCNT(sl->family_data));
+error:
+	return ret;
+}
+
+static int recall_eeprom(struct w1_slave *sl)
+{
+	struct w1_master *dev_master = sl->master;
+	int max_trying = W1_THERM_MAX_TRY;
+	int ret = -ENODEV;
+
+	if (!sl->family_data) 
+		goto error;
+
+	// prevent the slave from going away in sleep 
+	atomic_inc(THERM_REFCNT(sl->family_data));
+
+	if (!get_bus_mutex_lock (&dev_master->bus_mutex)){
+		ret = -EAGAIN;	// Didn't acquire the mutex
+		goto dec_refcnt;
+	}
+
+	while ( max_trying-- && ret ) { /* ret should be 0 */
+
+		if (!reset_select_slave(sl)) {	/* safe version to select slave */
+
+			w1_write_8(dev_master, W1_RECALL_EEPROM);
+			
+			ret = 1; /* Slave will pull line to 0 during recalling */
+			while (ret)
+				ret = 1 - w1_touch_bit(dev_master, 1);
+		}
+
+	}
+
+	mutex_unlock(&dev_master->bus_mutex);	
+
+dec_refcnt:
+	atomic_dec(THERM_REFCNT(sl->family_data));
+error:
+	return ret;
+}
+
+static int read_powermode(struct w1_slave *sl)
+{
+	struct w1_master *dev_master = sl->master;
+	int max_trying = W1_THERM_MAX_TRY;
+	int  ret = -ENODEV;
+
+	if (!sl->family_data) 
+		goto error;
+
+	/* prevent the slave from going away in sleep */
+	atomic_inc(THERM_REFCNT(sl->family_data));
+
+	if (!get_bus_mutex_lock (&dev_master->bus_mutex)){
+		ret = -EAGAIN;	// Didn't acquire the mutex
+		goto dec_refcnt;
+	}
+
+	while ( (max_trying--) && (ret < 0) ) { /* ret should be either 1 either 0 */
+
+		if (!reset_select_slave(sl)) {	/* safe version to select slave */
+			w1_write_8(dev_master, W1_READ_PSUPPLY);
+			/* Read only one bit, 1 is externally powered, 0 is parasite powered */
+			ret = w1_touch_bit(dev_master, 1);
+		}
+	}
+	mutex_unlock(&dev_master->bus_mutex);	
+
+dec_refcnt:
+	atomic_dec(THERM_REFCNT(sl->family_data));
+error:
+	return ret;
+}
+
+/*------------------------Interface Functions--------------------------*/
 
 static ssize_t read_therm(struct device *device,
 			  struct w1_slave *sl, struct therm_info *info)
@@ -611,6 +1070,141 @@ static ssize_t w1_slave_show(struct device *device,
 	return ret;
 }
 
+
+ // ASH //////////////////////////////////////////////////////////////////////////////////
+
+static ssize_t temperature_show(struct device *device,
+	struct device_attribute *attr, char *buf)
+{
+	struct w1_slave *sl = dev_to_w1_slave(device);
+	struct therm_info info;
+	int ret = 0;
+
+	if ( (!sl->family_data) || (!device_family(sl)) ){
+		dev_info(device,
+			"Device not supported by the driver\n");
+		return 0;  /* No device family */
+	}
+	
+	/* get the correct function depending on the device */
+	ret = convert_t(sl, &info);
+
+	if ( ret < 0 ){
+		dev_dbg(device,
+			"Temperature data may be corrupted. err=%d\n",
+			ret);
+		return 0;
+	}
+	// TODO Arrange temperature conversion per device
+	return sprintf(buf, "%d\n", w1_convert_temp(info.rom, sl->family->fid));
+}
+	
+static ssize_t ext_power_show(struct device *device,
+	struct device_attribute *attr, char *buf)
+{
+	struct w1_slave *sl = dev_to_w1_slave(device);
+
+	if (!sl->family_data){
+		dev_info(device,
+			"Device not supported by the driver\n");
+		return 0;  /* No device family */
+	}
+		
+	/* Getting the power mode of the device {external, parasite}*/
+	SLAVE_POWERMODE(sl) = read_powermode(sl);
+	
+	if (SLAVE_POWERMODE(sl)<0){
+		dev_dbg(device,
+			"Power_mode may be corrupted. err=%d\n",
+			SLAVE_POWERMODE(sl));
+	}
+	return sprintf(buf, "%d\n", SLAVE_POWERMODE(sl));
+}
+
+static ssize_t resolution_show(struct device *device,
+	struct device_attribute *attr, char *buf)
+{
+	struct w1_slave *sl = dev_to_w1_slave(device);
+
+	if ( (!sl->family_data) || (!device_family(sl)) ){
+		dev_info(device,
+			"Device not supported by the driver\n");
+		return 0;  /* No device family */
+	}
+	
+	/* get the correct function depending on the device */
+	SLAVE_RESOLUTION(sl) = device_family(sl)->get_resolution(sl);
+	if (SLAVE_RESOLUTION(sl)<0){
+		dev_dbg(device,
+			"Resolution may be corrupted. err=%d\n",
+			SLAVE_RESOLUTION(sl));
+	}
+
+	return sprintf(buf, "%d\n", SLAVE_RESOLUTION(sl));
+}
+
+static ssize_t resolution_store(struct device *device,
+	struct device_attribute *attr, const char *buf, size_t size)
+{
+	struct w1_slave *sl = dev_to_w1_slave(device);
+	int val;
+	int ret = 0;
+
+	ret = kstrtoint(buf, 10, &val); /* converting user entry to int */
+
+	if (ret) {	/* conversion error */
+		dev_info(device, "resolution_store() "
+						"conversion error. err= %d\n",
+						ret);
+		return size;	/* return size to avoid calling back again the callback*/
+	}
+
+	if ( (!sl->family_data) || (!device_family(sl)) ){
+		dev_info(device,
+			"Device not supported by the driver\n");
+		return size;  /* No device family */
+	}
+
+	// TODO Move resolution backup in struct in hardware function ?//////////////////////////
+	/* Don't deal with the val enterd by user, 
+		only device knows what is correct or not */
+
+	/* get the correct function depending on the device */
+	ret = device_family(sl)->set_resolution(sl, val);
+
+	if (ret){
+		dev_info(device, "resolution_store() "
+						"writing error %d\n", ret);
+		return size; /* return size to avoid calling back again the callback*/
+	}
+	else
+		SLAVE_RESOLUTION(sl) = val;
+	
+	return size;
+}
+
+static ssize_t eeprom_store(struct device *device,
+	struct device_attribute *attr, const char *buf, size_t size)
+{
+	struct w1_slave *sl = dev_to_w1_slave(device);
+	int ret = -EINVAL; // Invalid argument
+
+	if (size == sizeof(EEPROM_CMD_WRITE)){
+		if (!strncmp( buf , EEPROM_CMD_WRITE, sizeof(EEPROM_CMD_WRITE)-1 ))
+			ret = copy_scratchpad(sl);
+	} else if (size == sizeof(EEPROM_CMD_READ)){
+		if (!strncmp( buf , EEPROM_CMD_READ, sizeof(EEPROM_CMD_READ)-1 ))
+			ret = recall_eeprom(sl);
+	}
+
+	if(ret)
+		dev_info(device, "eeprom_store() "
+						"error in process %d\n", ret);
+
+	return size;
+}
+ // ASH //////////////////////////////////////////////////////////////////////////////////
+
 #if IS_REACHABLE(CONFIG_HWMON)
 static int w1_read_temp(struct device *device, u32 attr, int channel,
 			long *val)
@@ -728,24 +1322,40 @@ error:
 
 static int __init w1_therm_init(void)
 {
-	int err, i;
+	int err, i, nb_registred;
+	nb_registred = 0;
+	// TODO : remove kmseg 
+	printk(KERN_INFO "w1_therm: Entering Module, registering sensors");
 
 	for (i = 0; i < ARRAY_SIZE(w1_therm_families); ++i) {
 		err = w1_register_family(w1_therm_families[i].f);
 		if (err)
 			w1_therm_families[i].broken = 1;
+		else
+			nb_registred++;
 	}
+	// TODO : remove kmseg 
+	printk(KERN_INFO "w1_therm: Module loaded %d registred families\n", nb_registred);
 
 	return 0;
 }
 
 static void __exit w1_therm_fini(void)
 {
-	int i;
+	int i,nb_unregistred;
+	nb_unregistred = 0;
+	// TODO : remove kmseg 
+	printk(KERN_INFO "w1_therm: Leaving module, unregistring module");
 
 	for (i = 0; i < ARRAY_SIZE(w1_therm_families); ++i)
 		if (!w1_therm_families[i].broken)
+		{
 			w1_unregister_family(w1_therm_families[i].f);
+			nb_unregistred++;
+		}
+	// TODO : remove kmseg 
+	printk(KERN_INFO "w1_therm: Module unloaded %d unregistred families\n", nb_unregistred);
+			
 }
 
 module_init(w1_therm_init);
