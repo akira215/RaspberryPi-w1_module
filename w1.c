@@ -634,6 +634,7 @@ static int w1_family_notify(unsigned long action, struct w1_slave *sl)
 	case BUS_NOTIFY_ADD_DEVICE:
 		/* if the family driver needs to initialize something... */
 		if (fops->add_slave) {
+
 			err = fops->add_slave(sl);
 			if (err < 0) {
 				dev_err(&sl->dev,
@@ -642,6 +643,7 @@ static int w1_family_notify(unsigned long action, struct w1_slave *sl)
 				return err;
 			}
 		}
+
 		if (fops->groups) {
 			err = sysfs_create_groups(&sl->dev.kobj, fops->groups);
 			if (err) {
@@ -712,6 +714,7 @@ static int __w1_attach_slave_device(struct w1_slave *sl)
 		put_device(&sl->dev);
 		return err;
 	}
+
 	w1_family_notify(BUS_NOTIFY_ADD_DEVICE, sl);
 
 	dev_set_uevent_suppress(&sl->dev, false);

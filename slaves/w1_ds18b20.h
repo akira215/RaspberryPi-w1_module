@@ -1,3 +1,17 @@
+#ifndef __W1_DS18B20_H
+#define __W1_DS18B20_H
+
+#include <asm/types.h>
+
+#include <linux/device.h>
+#include <linux/types.h>
+#include <linux/mutex.h>
+#include <linux/w1.h>
+
+//#include "w1_therm_base.h"
+
+#define W1_THERM_DS18B20	0x28
+
 /*
  * Copyright (c) 2020 Akira Corp. <akira215corp@gmail.com>
  *
@@ -12,15 +26,6 @@
  * GNU General Public License for more details.
  */
 
-#ifndef __W1_THERM_H
-#define __W1_THERM_H
-
-#include <asm/types.h>
-
-#include <linux/device.h>
-#include <linux/types.h>
-#include <linux/mutex.h>
-#include <linux/w1.h>
 
 /*      --------------Defines-----------------         */
 
@@ -28,11 +33,12 @@
 
 #define W1_THERM_MAX_TRY		    5	/* Nb of try for an operation */
 #define W1_THERM_RETRY_DELAY	    20	/* Delay in ms to retry to acquire bus mutex */
+
+
 #define W1_THERM_EEPROM_WRITE_DELAY	10	/* Delay in ms to write in EEPROM */
 
 #define EEPROM_CMD_WRITE    "write" /* command to be written in the eeprom sysfs */
 #define EEPROM_CMD_READ     "read"  /* to trigger device EEPROM operations */
-#define BULK_TRIGGER_CMD    "bulk"  /* to trigger a bulk read on the bus */
 /*      --------------Structs-----------------         */
 
 /*
@@ -49,7 +55,6 @@ struct w1_therm_family_data {
 	atomic_t refcnt;
 	int external_powered;
 	int resolution;
-	bool convert_triggered;
 };
 
 struct therm_info {
@@ -58,15 +63,11 @@ struct therm_info {
 	u8 verdict;
 };
 
-/* Counter for devices supporting bulk reading */
-static u16 bulk_read_device_counter = 0;
-
 /*      --------------Macros-----------------         */
-/* test bulk read supporting device. ID of device supporting this 
-	feature should be added in that test */
-#define SLAVE_SUPPORT_BULK_READ(sl) \
-	(sl->family->fid == W1_THERM_DS18B20)|| \
-	(sl->family->fid == W1_THERM_DS18S20)
+
+/* return the address of the refcnt in the family data */
+#define THERM_REFCNT(family_data) \
+	(&((struct w1_therm_family_data *)family_data)->refcnt)
 
 /* return the power mode of the sl slave : 1-ext, 0-parasite, <0 unknown 
 	always test family data existance before*/
@@ -77,14 +78,6 @@ static u16 bulk_read_device_counter = 0;
 	always test family data existance before*/
 #define SLAVE_RESOLUTION(sl) \
 	(((struct w1_therm_family_data *)(sl->family_data))->resolution)
-
-/* return wether or not a converT command has been issued to the slave*/
-#define SLAVE_CONVERT_TRIGGERED(sl) \
-	(((struct w1_therm_family_data *)(sl->family_data))->convert_triggered)
-
-/* return the address of the refcnt in the family data */
-#define THERM_REFCNT(family_data) \
-	(&((struct w1_therm_family_data *)family_data)->refcnt)
 
 /*      --------------Interface sysfs-----------------         */
 
@@ -98,7 +91,7 @@ static ssize_t w1_seq_show(struct device *device,
 	struct device_attribute *attr, char *buf);
 
 // ASH new files ///////////////////////////////////////////////////
-/* @brief A callback function to output the temperature (1/1000°)
+/*
 * temperature_show
 * read temperature and return the result in the sys file 
 * Main differences with w1_slave :
@@ -142,22 +135,12 @@ static ssize_t resolution_store(struct device *device,
  *  @param device represents the device
  *  @param attr the pointer to the kobj_attribute struct
  *  @param buf the buffer from which the instruction (direction) will be read
- *       EEPROM_CMD_WRITE 'write' -> device write RAM to EEPROM, 
- *       EEPROM_CMD_READ  'read' -> device read EEPROM and put to RAM
+ *              'write' -> device write RAM to EEPROM, 
+ *              'read' -> device read EEPROM and put to RAM
  *  @param size the number characters in the buffer
  *  @return return should return the total number of characters used from the buffer
  */
 static ssize_t eeprom_store(struct device *device,
-	struct device_attribute *attr, const char *buf, size_t size);
-
-/** @brief A callback function to trigger bulk read on the bus
- *  @param device represents the device
- *  @param attr the pointer to the kobj_attribute struct
- *  @param buf the buffer from which the instruction BULK_TRIGGER_CMD will be read
- *  @param size the number characters in the buffer
- *  @return return should return the total number of characters used from the buffer
- */
-static ssize_t bulk_read_store(struct device *device,
 	struct device_attribute *attr, const char *buf, size_t size);
 
 /*      --------------Attributes declarations-----------------         */
@@ -169,8 +152,7 @@ static DEVICE_ATTR_RO(ext_power);
 static DEVICE_ATTR_RW(resolution); // TODO implement
 static DEVICE_ATTR_RO(temperature);
 //static DEVICE_ATTR_RW(alarms);	// TODO implement
-static DEVICE_ATTR_WO(eeprom);	
-static DEVICE_ATTR_WO(bulk_read); /* attribut at master level */
+static DEVICE_ATTR_WO(eeprom);	// TODO implement
 
 
 /*      --------------- Helpers Functions-----------------         */
@@ -179,7 +161,7 @@ static DEVICE_ATTR_WO(bulk_read); /* attribut at master level */
  * @param: lock: w1 bus mutex to get
  * return value : true is mutex is acquired and lock, false otherwise
 */
-static inline bool get_bus_mutex_lock(struct mutex *lock);
+extern bool w1_get_bus_mutex_lock(struct mutex *);
 
 /* get_convertion_time() get the Tconv fo the device
  * @param: sl: device to get the conversion time
@@ -247,13 +229,6 @@ static int recall_eeprom(struct w1_slave *sl);
  */
 static int read_powermode(struct w1_slave *sl);
 
-/* trigger_bulk_read() - send a SKIP ROM follow by a CONVERT T commmand
- * on the bus. It also set a flag in each slave struct to signal
- * @dev_master		the device master of the bus
- * return value : 0 if success, -kernel error code otherwise
- */
-static int trigger_bulk_read(struct w1_master *dev_master);
-
 /*      ---------------Interface Functions-----------------         */
 
 /* w1_therm_add_slave() - Called each time a search discover a new device
@@ -294,4 +269,5 @@ static inline int w1_DS18B20_get_resolution(struct w1_slave *sl);
  * return value : resolution in bit [9..12] or negative kernel error code
 */
 static inline int w1_DS18S20_get_resolution(struct w1_slave *sl);
-#endif  /* __W1_THERM_H */
+
+#endif  /* __W1_DS18B20_H */
