@@ -22,7 +22,7 @@
 #include <linux/mutex.h>
 #include <linux/w1.h>
 
-/*      --------------Defines-----------------         */
+/*----------------------------------Defines---------------------------------*/
 
 #define W1_RECALL_EEPROM	0xB8    /* This command should be in public header w1.h but is not */
 
@@ -30,13 +30,17 @@
 #define W1_THERM_RETRY_DELAY	    20	/* Delay in ms to retry to acquire bus mutex */
 #define W1_THERM_EEPROM_WRITE_DELAY	10	/* Delay in ms to write in EEPROM */
 
-#define EEPROM_CMD_WRITE    "write" /* command to be written in the eeprom sysfs */
-#define EEPROM_CMD_READ     "read"  /* to trigger device EEPROM operations */
-#define BULK_TRIGGER_CMD    "bulk"  /* to trigger a bulk read on the bus */
-/*      --------------Structs-----------------         */
+#define EEPROM_CMD_WRITE    "save" 		/* command to be written in the eeprom sysfs */
+#define EEPROM_CMD_READ     "restore"  	/* to trigger device EEPROM operations */
+#define BULK_TRIGGER_CMD    "trigger"   /* to trigger a bulk read on the bus */
+
+/* Counter for devices supporting bulk reading */
+static u16 bulk_read_device_counter = 0;
+
+/*----------------------------------Structs---------------------------------*/
 
 /*
- * w1_therm_family_data 
+ * struct w1_therm_family_data 
  * rom : data
  * refcnt : ref count
  * external_powered : 1 - device powered externally, 
@@ -49,24 +53,52 @@ struct w1_therm_family_data {
 	atomic_t refcnt;
 	int external_powered;
 	int resolution;
-	bool convert_triggered;
+	int convert_triggered;
 };
 
+/*
+ * struct therm_info
+ * Only used to store temperature reading
+ * rom : RAM device data
+ * crc : computed crc from rom
+ * verdict: 1 crc checked, 0 crc not matching
+*/
 struct therm_info {
 	u8 rom[9];
 	u8 crc;
 	u8 verdict;
 };
 
-/* Counter for devices supporting bulk reading */
-static u16 bulk_read_device_counter = 0;
+/*
+ * struct w1_therm_family_converter
+ * Used to bind standard function call
+ * to device specific function
+ * it could be routed to NULL if device don't support feature
+ * see helper : device_family() 
+ */
+struct w1_therm_family_converter {
+	u8					broken;
+	u16					reserved;
+	struct w1_family	*f;
+	int					(*convert)(u8 rom[9]);
+	int					(*get_conversion_time)(struct w1_slave *sl);
+	int					(*set_resolution)(struct w1_slave *sl, int val);
+	int					(*get_resolution)(struct w1_slave *sl);
+	bool				bulk_read;
+};
+// TODO check eeprom field : copy srachpad and recall eeprom ??
+/*-----------------------Device specific functions-------------------------*/
 
-/*      --------------Macros-----------------         */
-/* test bulk read supporting device. ID of device supporting this 
-	feature should be added in that test */
-#define SLAVE_SUPPORT_BULK_READ(sl) \
-	(sl->family->fid == W1_THERM_DS18B20)|| \
-	(sl->family->fid == W1_THERM_DS18S20)
+static inline int w1_DS18B20_convert_temp(u8 rom[9]);
+static inline int w1_DS18S20_convert_temp(u8 rom[9]);
+
+static inline int w1_DS18B20_convert_time(struct w1_slave *sl);
+static inline int w1_DS18S20_convert_time(struct w1_slave *sl);
+
+static inline int w1_DS18B20_set_resolution(struct w1_slave *sl, int val);
+static inline int w1_DS18B20_get_resolution(struct w1_slave *sl);
+
+/*-------------------------------Macros--------------------------------------*/
 
 /* return the power mode of the sl slave : 1-ext, 0-parasite, <0 unknown 
 	always test family data existance before*/
@@ -78,7 +110,11 @@ static u16 bulk_read_device_counter = 0;
 #define SLAVE_RESOLUTION(sl) \
 	(((struct w1_therm_family_data *)(sl->family_data))->resolution)
 
-/* return wether or not a converT command has been issued to the slave*/
+/*  return wether or not a converT command has been issued to the slave
+ *  0: no bulk read is pending
+ * -1: conversion is in progress
+ *  1: conversion done, result to be read
+*/
 #define SLAVE_CONVERT_TRIGGERED(sl) \
 	(((struct w1_therm_family_data *)(sl->family_data))->convert_triggered)
 
@@ -86,108 +122,43 @@ static u16 bulk_read_device_counter = 0;
 #define THERM_REFCNT(family_data) \
 	(&((struct w1_therm_family_data *)family_data)->refcnt)
 
-/*      --------------Interface sysfs-----------------         */
+/*-------------------------- Helpers Functions------------------------------*/
 
-static ssize_t w1_slave_show(struct device *device,
-	struct device_attribute *attr, char *buf);
-
-static ssize_t w1_slave_store(struct device *device,
-	struct device_attribute *attr, const char *buf, size_t size);
-
-static ssize_t w1_seq_show(struct device *device,
-	struct device_attribute *attr, char *buf);
-
-// ASH new files ///////////////////////////////////////////////////
-/* @brief A callback function to output the temperature (1/1000°)
-* temperature_show
-* read temperature and return the result in the sys file 
-* Main differences with w1_slave :
-*	- No hardware check ()
+/*  device_family() 
+ *  @brief Helper function that provide a pointer on the w1_therm_family_converter struct
+ *  @param sl represents the device 
+ *  @return pointer to the slaves's family converter, NULL if not known
 */
-static ssize_t temperature_show(struct device *device,
-	struct device_attribute *attr, char *buf);
+static struct w1_therm_family_converter *device_family(struct w1_slave *sl);
 
-/** @brief A callback function to output the power mode of the device
- *	Ask the device to get its powering mode
- * 	Once done, it is stored in the sl->family_data to avoid doing the test
- * 	during data read. Negative results are kernel error code
- *  @param device represents the device
- *  @param attr the pointer to the kobj_attribute struct
- *  @param buf the buffer to which to write the resolution
- *  @return return the total number of characters written to the buffer (excluding null)
- */
-static ssize_t ext_power_show(struct device *device,
-	struct device_attribute *attr, char *buf);
-
-/** @brief A callback function to output the resolution of the device
- *  @param device represents the device
- *  @param attr the pointer to the kobj_attribute struct
- *  @param buf the buffer to which to write the resolution
- *  @return return the total number of characters written to the buffer (excluding null)
- */
-static ssize_t resolution_show(struct device *device,
-	struct device_attribute *attr, char *buf);
-
-/** @brief A callback function to store the user resolution in the device RAM
- *  @param device represents the device
- *  @param attr the pointer to the kobj_attribute struct
- *  @param buf the buffer from which to read resolution to be set
- *  @param size the number characters in the buffer
- *  @return return should return the total number of characters used from the buffer
- */
-static ssize_t resolution_store(struct device *device,
-	struct device_attribute *attr, const char *buf, size_t size);
-
-/** @brief A callback function to let the user read/write device EEPROM
- *  @param device represents the device
- *  @param attr the pointer to the kobj_attribute struct
- *  @param buf the buffer from which the instruction (direction) will be read
- *       EEPROM_CMD_WRITE 'write' -> device write RAM to EEPROM, 
- *       EEPROM_CMD_READ  'read' -> device read EEPROM and put to RAM
- *  @param size the number characters in the buffer
- *  @return return should return the total number of characters used from the buffer
- */
-static ssize_t eeprom_store(struct device *device,
-	struct device_attribute *attr, const char *buf, size_t size);
-
-/** @brief A callback function to trigger bulk read on the bus
- *  @param device represents the device
- *  @param attr the pointer to the kobj_attribute struct
- *  @param buf the buffer from which the instruction BULK_TRIGGER_CMD will be read
- *  @param size the number characters in the buffer
- *  @return return should return the total number of characters used from the buffer
- */
-static ssize_t bulk_read_store(struct device *device,
-	struct device_attribute *attr, const char *buf, size_t size);
-
-/*      --------------Attributes declarations-----------------         */
-
-static DEVICE_ATTR_RW(w1_slave);
-static DEVICE_ATTR_RO(w1_seq);
-
-static DEVICE_ATTR_RO(ext_power);
-static DEVICE_ATTR_RW(resolution); // TODO implement
-static DEVICE_ATTR_RO(temperature);
-//static DEVICE_ATTR_RW(alarms);	// TODO implement
-static DEVICE_ATTR_WO(eeprom);	
-static DEVICE_ATTR_WO(bulk_read); /* attribut at master level */
-
-
-/*      --------------- Helpers Functions-----------------         */
-
-/* get_convertion_time() get the Tconv fo the device
+/* bus_mutex_lock() get the mutex & retry
  * @param: lock: w1 bus mutex to get
  * return value : true is mutex is acquired and lock, false otherwise
 */
-static inline bool get_bus_mutex_lock(struct mutex *lock);
+static inline bool bus_mutex_lock(struct mutex *lock);
 
-/* get_convertion_time() get the Tconv fo the device
+/* support_bulk_read() check is device is supporting bulk read
+ * @param: sl: device to get the conversion time
+ * return value : true : bulk read support, false : no support or error
+*/
+static inline bool bulk_read_support(struct w1_slave *sl);
+
+
+/* conversion_time() get the Tconv fo the device
  * @param: sl: device to get the conversion time
  * return value : positive value is conversion time in ms, negative values kernel error code otherwise
 */
-static inline int get_convertion_time(struct w1_slave *sl);
+static inline int conversion_time(struct w1_slave *sl);
 
-/*      ---------------Hardware Functions-----------------         */
+/* temperature_from_RAM() return the temperature in 1/100°
+ * Device dependant, it will select the correct computation method
+ * @param: sl: device that sent the RAM data
+ * @param: rom: ram read value
+ * return value : positive value istemperature in 1/1000°, negative values kernel error code otherwise
+*/
+static inline int temperature_from_RAM(struct w1_slave *sl, u8 rom[9]);
+
+/*---------------------------Hardware Functions-----------------------------*/
 
 /**
  * reset_select_slave() - reset and select a slave
@@ -254,7 +225,113 @@ static int read_powermode(struct w1_slave *sl);
  */
 static int trigger_bulk_read(struct w1_master *dev_master);
 
-/*      ---------------Interface Functions-----------------         */
+
+/*-----------------------------Interface sysfs--------------------------------*/
+
+/* @brief A callback function to output the temperature Old way
+ * read temperature and return the result in the sys file 
+ * This has been kept for compatibility
+ */
+static ssize_t w1_slave_show(struct device *device,
+	struct device_attribute *attr, char *buf);
+
+/* @brief A callback function to set the resolution Old way
+ * If value is 0, it write config in the EEPROM
+ * If value is 9..12, it set the resolution in the RAM 
+ * This has been kept for compatibility
+ */
+static ssize_t w1_slave_store(struct device *device,
+	struct device_attribute *attr, const char *buf, size_t size);
+
+static ssize_t w1_seq_show(struct device *device,
+	struct device_attribute *attr, char *buf);
+
+/* @brief A callback function to output the temperature (1/1000°)
+* temperature_show
+* read temperature and return the result in the sys file 
+* Main differences with w1_slave :
+*	- No hardware check ()
+*/
+static ssize_t temperature_show(struct device *device,
+	struct device_attribute *attr, char *buf);
+
+/** @brief A callback function to output the power mode of the device
+ *	Ask the device to get its powering mode
+ * 	Once done, it is stored in the sl->family_data to avoid doing the test
+ * 	during data read. Negative results are kernel error code
+ *  @param device represents the device
+ *  @param attr the pointer to the kobj_attribute struct
+ *  @param buf the buffer to which to write the resolution
+ *  @return return the total number of characters written to the buffer (excluding null)
+ */
+static ssize_t ext_power_show(struct device *device,
+	struct device_attribute *attr, char *buf);
+
+/** @brief A callback function to output the resolution of the device
+ *  @param device represents the device
+ *  @param attr the pointer to the kobj_attribute struct
+ *  @param buf the buffer to which to write the resolution
+ *  @return return the total number of characters written to the buffer (excluding null)
+ */
+static ssize_t resolution_show(struct device *device,
+	struct device_attribute *attr, char *buf);
+
+/** @brief A callback function to store the user resolution in the device RAM
+ *  @param device represents the device
+ *  @param attr the pointer to the kobj_attribute struct
+ *  @param buf the buffer from which to read resolution to be set
+ *  @param size the number characters in the buffer
+ *  @return return should return the total number of characters used from the buffer
+ */
+static ssize_t resolution_store(struct device *device,
+	struct device_attribute *attr, const char *buf, size_t size);
+
+/** @brief A callback function to let the user read/write device EEPROM
+ *  @param device represents the device
+ *  @param attr the pointer to the kobj_attribute struct
+ *  @param buf the buffer from which the instruction (direction) will be read
+ *       EEPROM_CMD_WRITE 'write' -> device write RAM to EEPROM, 
+ *       EEPROM_CMD_READ  'read' -> device read EEPROM and put to RAM
+ *  @param size the number characters in the buffer
+ *  @return return should return the total number of characters used from the buffer
+ */
+static ssize_t eeprom_store(struct device *device,
+	struct device_attribute *attr, const char *buf, size_t size);
+
+/** @brief A callback function to trigger bulk read on the bus
+ *  @param device represents the master device
+ *  @param attr the pointer to the kobj_attribute struct
+ *  @param buf the buffer from which the instruction BULK_TRIGGER_CMD will be read
+ *  @param size the number characters in the buffer
+ *  @return return should return the total number of characters used from the buffer
+ */
+static ssize_t bulk_read_store(struct device *device,
+	struct device_attribute *attr, const char *buf, size_t size);
+
+
+/** @brief A callback function to check if bulk read is on progress
+ *  @param device represents the master device
+ *  @param attr the pointer to the kobj_attribute struct
+ *  @param buf the buffer from which the instruction BULK_TRIGGER_CMD will be read
+ *  @param size the number characters in the buffer
+ *  @return return should return the total number of characters used from the buffer
+ */
+static ssize_t bulk_read_show(struct device *device,
+	struct device_attribute *attr, char *buf);
+
+/*-----------------------------Attributes declarations-------------------------------*/
+
+static DEVICE_ATTR_RW(w1_slave);
+static DEVICE_ATTR_RO(w1_seq);
+
+static DEVICE_ATTR_RO(ext_power);
+static DEVICE_ATTR_RW(resolution);
+static DEVICE_ATTR_RO(temperature);
+//static DEVICE_ATTR_RW(alarms);	// TODO implement
+static DEVICE_ATTR_WO(eeprom);	
+static DEVICE_ATTR_RW(bulk_read); /* attribut at master level */
+
+/*-----------------------------Interface Functions------------------------------------*/
 
 /* w1_therm_add_slave() - Called each time a search discover a new device
  * used to initialized slave (family datas)
@@ -276,22 +353,10 @@ static void w1_therm_remove_slave(struct w1_slave *sl);
 */
 static inline int w1_DS18B20_set_resolution(struct w1_slave *sl, int val);
 
-/* w1_DS18S20_set_resolution() write new resolution to the RAM device
- * @param: device: device to set the resolution
- * @param: val: new resolution in bit [9..12]
- * return value : 0 if success, negative kernel error code otherwise
-*/
-static inline int w1_DS18S20_set_resolution(struct w1_slave *sl, int val);
-
 /* w1_DS18B20_get_resolution() read the device RAM to get its resolution setting
  * @param: device: device to get the resolution form
  * return value : resolution in bit [9..12] or negative kernel error code
 */
 static inline int w1_DS18B20_get_resolution(struct w1_slave *sl);
 
-/* w1_DS18B20_get_resolution() read the device RAM to get its resolution setting
- * @param: device: device to get the rsolution form
- * return value : resolution in bit [9..12] or negative kernel error code
-*/
-static inline int w1_DS18S20_get_resolution(struct w1_slave *sl);
 #endif  /* __W1_THERM_H */
