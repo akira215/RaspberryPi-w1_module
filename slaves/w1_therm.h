@@ -34,6 +34,9 @@
 #define EEPROM_CMD_READ     "restore"  	/* to trigger device EEPROM operations */
 #define BULK_TRIGGER_CMD    "trigger"   /* to trigger a bulk read on the bus */
 
+#define MIN_TEMP	-55	/* min temperature that can be mesured */
+#define MAX_TEMP	125	/* max temperature that can be mesured */
+
 /* Counter for devices supporting bulk reading */
 static u16 bulk_read_device_counter = 0;
 
@@ -84,6 +87,7 @@ struct w1_therm_family_converter {
 	int					(*get_conversion_time)(struct w1_slave *sl);
 	int					(*set_resolution)(struct w1_slave *sl, int val);
 	int					(*get_resolution)(struct w1_slave *sl);
+	int					(*write_data)(struct w1_slave *sl, const u8 *data);
 	bool				bulk_read;
 };
 // TODO check eeprom field : copy srachpad and recall eeprom ??
@@ -94,6 +98,9 @@ static inline int w1_DS18S20_convert_temp(u8 rom[9]);
 
 static inline int w1_DS18B20_convert_time(struct w1_slave *sl);
 static inline int w1_DS18S20_convert_time(struct w1_slave *sl);
+
+static inline int w1_DS18B20_write_data(struct w1_slave *sl,const u8 *data);
+static inline int w1_DS18S20_write_data(struct w1_slave *sl,const u8 *data);											
 
 static inline int w1_DS18B20_set_resolution(struct w1_slave *sl, int val);
 static inline int w1_DS18B20_get_resolution(struct w1_slave *sl);
@@ -143,7 +150,6 @@ static inline bool bus_mutex_lock(struct mutex *lock);
 */
 static inline bool bulk_read_support(struct w1_slave *sl);
 
-
 /* conversion_time() get the Tconv fo the device
  * @param: sl: device to get the conversion time
  * return value : positive value is conversion time in ms, negative values kernel error code otherwise
@@ -157,6 +163,13 @@ static inline int conversion_time(struct w1_slave *sl);
  * return value : positive value istemperature in 1/1000°, negative values kernel error code otherwise
 */
 static inline int temperature_from_RAM(struct w1_slave *sl, u8 rom[9]);
+
+/* int_to_short() safe casting of int to short
+ * min/max values are defined by Macro
+ * @param: i integer to be converted to short
+ * return value : a short in the range of min/max value
+*/
+static inline s8 int_to_short(int i);
 
 /*---------------------------Hardware Functions-----------------------------*/
 
@@ -175,6 +188,13 @@ static inline int temperature_from_RAM(struct w1_slave *sl, u8 rom[9]);
  */
 static int reset_select_slave(struct w1_slave *sl);
 
+/* convert_t()
+ * @sl: 				pointer to the slave to read
+ * @info: 	pointer to a structure to store the read results
+ * return value: 0 if success, -kernel error code otherwise
+ */
+static int convert_t(struct w1_slave *sl, struct therm_info *info);
+
 /* read_scratchpad()
  * @sl: 	pointer to the slave to read
  * @info: 	pointer to a structure to store the read results
@@ -182,20 +202,13 @@ static int reset_select_slave(struct w1_slave *sl);
  */
 static int read_scratchpad(struct w1_slave *sl, struct therm_info *info);
 
-/* write_scratchpad()
- * @sl: 				pointer to the slave to read
- * @data: 				pointer to an array of 3 bytes, as 3 bytes MUST be written
- * @pullup_duration: 	duration in ms of pullup, only for parasited powered devices
+/* write_data()
+ * @sl: 		pointer to the slave to read
+ * @data: 		pointer to an array of 3 bytes, as 3 bytes MUST be written
+ * @nb_bytes: 	Nb bytes to be written (2 for DS18S20, 3 for other devices)
  * return value: 0 if success, -kernel error code otherwise
  */
-static int write_scratchpad(struct w1_slave *sl, const u8 *data);
-
-/* convert_t()
- * @sl: 				pointer to the slave to read
- * @info: 	pointer to a structure to store the read results
- * return value: 0 if success, -kernel error code otherwise
- */
-static int convert_t(struct w1_slave *sl, struct therm_info *info);
+static int write_scratchpad(struct w1_slave *sl, const u8 *data, u8 nb_bytes);
 
 /* copy_scratchpad() - Copy the content of scratchpad in device EEPROM
  * @sl:		slave involved
@@ -298,6 +311,26 @@ static ssize_t resolution_store(struct device *device,
 static ssize_t eeprom_store(struct device *device,
 	struct device_attribute *attr, const char *buf, size_t size);
 
+/** @brief A callback function to set the alarms level
+ *  @param device represents the master device
+ *  @param attr the pointer to the kobj_attribute struct
+ *  @param buf the buffer from which the TH and TL will be read
+ *  @param size the number characters in the buffer
+ *  @return return should return the total number of characters used from the buffer
+ */
+static ssize_t alarms_store(struct device *device,
+	struct device_attribute *attr, const char *buf, size_t size);
+
+/** @brief A callback function to get the alarms level
+ *  @param device represents the master device
+ *  @param attr the pointer to the kobj_attribute struct
+ *  @param buf the buffer from which the TH and TL will be sent
+ *  @param size the number characters in the buffer
+ *  @return return should return the total number of characters used from the buffer
+ */
+static ssize_t alarms_show(struct device *device,
+	struct device_attribute *attr, char *buf);
+
 /** @brief A callback function to trigger bulk read on the bus
  *  @param device represents the master device
  *  @param attr the pointer to the kobj_attribute struct
@@ -305,7 +338,7 @@ static ssize_t eeprom_store(struct device *device,
  *  @param size the number characters in the buffer
  *  @return return should return the total number of characters used from the buffer
  */
-static ssize_t bulk_read_store(struct device *device,
+static ssize_t therm_bulk_read_store(struct device *device,
 	struct device_attribute *attr, const char *buf, size_t size);
 
 
@@ -316,20 +349,23 @@ static ssize_t bulk_read_store(struct device *device,
  *  @param size the number characters in the buffer
  *  @return return should return the total number of characters used from the buffer
  */
-static ssize_t bulk_read_show(struct device *device,
+static ssize_t therm_bulk_read_show(struct device *device,
 	struct device_attribute *attr, char *buf);
+
+	
 
 /*-----------------------------Attributes declarations-------------------------------*/
 
 static DEVICE_ATTR_RW(w1_slave);
 static DEVICE_ATTR_RO(w1_seq);
-
+static DEVICE_ATTR_RO(temperature);
 static DEVICE_ATTR_RO(ext_power);
 static DEVICE_ATTR_RW(resolution);
-static DEVICE_ATTR_RO(temperature);
-//static DEVICE_ATTR_RW(alarms);	// TODO implement
-static DEVICE_ATTR_WO(eeprom);	
-static DEVICE_ATTR_RW(bulk_read); /* attribut at master level */
+static DEVICE_ATTR_WO(eeprom);
+static DEVICE_ATTR_RW(alarms);	// TODO implement
+
+static DEVICE_ATTR_RW(therm_bulk_read); /* attribut at master level */
+// TODO implement master level alarm routine
 
 /*-----------------------------Interface Functions------------------------------------*/
 
