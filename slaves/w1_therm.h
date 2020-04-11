@@ -43,36 +43,6 @@ static u16 bulk_read_device_counter = 0;
 /*----------------------------------Structs---------------------------------*/
 
 /*
- * struct w1_therm_family_data 
- * rom : data
- * refcnt : ref count
- * external_powered : 1 - device powered externally, 
- *					 0 - device parasite powered, 
- *					-x - error or undefined
- * resolution : resolution in bit of the device, negative value are error code
-*/
-struct w1_therm_family_data {
-	uint8_t rom[9];
-	atomic_t refcnt;
-	int external_powered;
-	int resolution;
-	int convert_triggered;
-};
-
-/*
- * struct therm_info
- * Only used to store temperature reading
- * rom : RAM device data
- * crc : computed crc from rom
- * verdict: 1 crc checked, 0 crc not matching
-*/
-struct therm_info {
-	u8 rom[9];
-	u8 crc;
-	u8 verdict;
-};
-
-/*
  * struct w1_therm_family_converter
  * Used to bind standard function call
  * to device specific function
@@ -90,7 +60,38 @@ struct w1_therm_family_converter {
 	int					(*write_data)(struct w1_slave *sl, const u8 *data);
 	bool				bulk_read;
 };
-// TODO check eeprom field : copy srachpad and recall eeprom ??
+
+/*
+ * struct w1_therm_family_data 
+ * rom : data
+ * refcnt : ref count
+ * external_powered : 1 - device powered externally, 
+ *					 0 - device parasite powered, 
+ *					-x - error or undefined
+ * resolution : resolution in bit of the device, negative value are error code
+*/
+struct w1_therm_family_data {
+	uint8_t rom[9];
+	atomic_t refcnt;
+	int external_powered;
+	int resolution;
+	int convert_triggered;
+	struct w1_therm_family_converter *specific_functions;
+};
+
+/*
+ * struct therm_info
+ * Only used to store temperature reading
+ * rom : RAM device data
+ * crc : computed crc from rom
+ * verdict: 1 crc checked, 0 crc not matching
+*/
+struct therm_info {
+	u8 rom[9];
+	u8 crc;
+	u8 verdict;
+};
+
 /*-----------------------Device specific functions-------------------------*/
 
 static inline int w1_DS18B20_convert_temp(u8 rom[9]);
@@ -106,6 +107,11 @@ static inline int w1_DS18B20_set_resolution(struct w1_slave *sl, int val);
 static inline int w1_DS18B20_get_resolution(struct w1_slave *sl);
 
 /*-------------------------------Macros--------------------------------------*/
+
+/* return a pointer on the slave w1_therm_family_converter struct: 
+	always test family data existance before*/
+#define SLAVE_SPECIFIC_FUNC(sl) \
+	(((struct w1_therm_family_data *)(sl->family_data))->specific_functions)
 
 /* return the power mode of the sl slave : 1-ext, 0-parasite, <0 unknown 
 	always test family data existance before*/
@@ -362,10 +368,9 @@ static DEVICE_ATTR_RO(temperature);
 static DEVICE_ATTR_RO(ext_power);
 static DEVICE_ATTR_RW(resolution);
 static DEVICE_ATTR_WO(eeprom);
-static DEVICE_ATTR_RW(alarms);	// TODO implement
+static DEVICE_ATTR_RW(alarms);
 
 static DEVICE_ATTR_RW(therm_bulk_read); /* attribut at master level */
-// TODO implement master level alarm routine
 
 /*-----------------------------Interface Functions------------------------------------*/
 

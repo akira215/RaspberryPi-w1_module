@@ -54,9 +54,17 @@ module_param_named(strong_pullup, w1_strong_pullup, int, 0);
 
 /*
  * sysfile interface:
- * w1_slave TODO fill
+ * w1_slave (RW) : Old driver way, kept for compatibility
+ *  		read : return 2 lines with the hexa output of the device
+ * 				   return the CRC check
+ * 				   return temperature in 1/1000°
+ * 			write : .0    :save the 2 or 3 bytes to the device EEPROM
+ * 							(i.e. TH, TL and config register)
+ * 					.9..12: set the device resolution in RAM (if supported)
+ * 					.Else : do nothing 
+ * 
  * temperature (RO):
- *	. temperature in 1/1000 °
+ *	. temperature in 1/1000°
  *
  * ext_power (RO):
  *	. -xx : xx is kernel error refer to /usr/include/asm/errno.h
@@ -93,7 +101,7 @@ module_param_named(strong_pullup, w1_strong_pullup, int, 0);
  * struct attribute for each device type
  * This will enable entry in sysfs, it should match device capability
 */
-// TODO add Alarms implementation
+
 static struct attribute *w1_therm_attrs[] = {
 	&dev_attr_w1_slave.attr,
 	&dev_attr_temperature.attr,	
@@ -104,7 +112,6 @@ static struct attribute *w1_therm_attrs[] = {
 	NULL,
 };
 
-// TODO add Alarms implementation
 static struct attribute *w1_ds18s20_attrs[] = {
 	&dev_attr_w1_slave.attr,
 	&dev_attr_temperature.attr,	
@@ -442,48 +449,37 @@ static inline bool bus_mutex_lock(struct mutex *lock)
 
 static inline bool bulk_read_support(struct w1_slave *sl)
 {
-	struct w1_therm_family_converter *fcv;
-	fcv = device_family(sl);
-
-	if (fcv)
-		return fcv->bulk_read;
+	if (SLAVE_SPECIFIC_FUNC(sl))
+		return SLAVE_SPECIFIC_FUNC(sl)->bulk_read;
 	else
 		dev_info(&sl->dev,
 			"%s: Device not supported by the driver\n", __func__);
 
 	return false;  /* No device family */
-
 }
 
 static inline int conversion_time(struct w1_slave *sl)
 {
-	struct w1_therm_family_converter *fcv;
-	fcv = device_family(sl);
-
-	if (fcv)
-		return fcv->get_conversion_time(sl);
+	if (SLAVE_SPECIFIC_FUNC(sl))
+		return SLAVE_SPECIFIC_FUNC(sl)->get_conversion_time(sl);
 	else
 		dev_info(&sl->dev,
 			"%s: Device not supported by the driver\n", __func__);
 
 	return -ENODEV;  /* No device family */
-
 }
 
 static inline int temperature_from_RAM (struct w1_slave *sl, u8 rom[9])
 {
-	struct w1_therm_family_converter *fcv;
-	fcv = device_family(sl);
-
-	if (fcv)
-		return fcv->convert(rom);
+	if (SLAVE_SPECIFIC_FUNC(sl))
+		return SLAVE_SPECIFIC_FUNC(sl)->convert(rom);
 	else
 		dev_info(&sl->dev,
 			"%s: Device not supported by the driver\n", __func__);
 
 	return 0;  /* No device family */
-
 }
+
 static inline s8 int_to_short(int i)
 {
 	/* Prepare to cast to short by eliminating out of range values */
@@ -497,6 +493,22 @@ static int w1_therm_add_slave(struct w1_slave *sl)
 {
 	struct w1_therm_family_converter *sl_family_conv;
 
+	/* Allocate memory*/
+	sl->family_data = kzalloc(sizeof(struct w1_therm_family_data),
+		GFP_KERNEL);
+	if (!sl->family_data)
+		return -ENOMEM;
+	atomic_set(THERM_REFCNT(sl->family_data), 1);
+
+	/* Get a pointer to the device specific function struct */
+	sl_family_conv = device_family(sl);
+	if (!sl_family_conv)
+	{
+		kfree(sl->family_data);
+		return -ENOSYS;
+	}
+	SLAVE_SPECIFIC_FUNC(sl) = sl_family_conv;
+	
 	if(bulk_read_support(sl)){
 		/* add the sys entry to trigger bulk_read at master level only the 1st time*/
 		if(!bulk_read_device_counter){	
@@ -510,13 +522,6 @@ static int w1_therm_add_slave(struct w1_slave *sl)
 		bulk_read_device_counter++;
 	}
 
-	/* Allocate memory*/
-	sl->family_data = kzalloc(sizeof(struct w1_therm_family_data),
-		GFP_KERNEL);
-	if (!sl->family_data)
-		return -ENOMEM;
-	atomic_set(THERM_REFCNT(sl->family_data), 1);
-
 	/* Getting the power mode of the device {external, parasite}*/
 	SLAVE_POWERMODE(sl) = read_powermode(sl);
 
@@ -528,10 +533,8 @@ static int w1_therm_add_slave(struct w1_slave *sl)
 	}
 
 	/* Getting the resolution of the device */
-	sl_family_conv = device_family(sl);
-
-	if(sl_family_conv->get_resolution) {
-		SLAVE_RESOLUTION(sl) = device_family(sl)->get_resolution(sl);
+	if(SLAVE_SPECIFIC_FUNC(sl)->get_resolution) {
+		SLAVE_RESOLUTION(sl) = SLAVE_SPECIFIC_FUNC(sl)->get_resolution(sl);
 		if ( SLAVE_RESOLUTION(sl) < 0)
 		{	/* no error returned because device has been added, put a non*/
 			dev_warn(&sl->dev,
@@ -753,7 +756,7 @@ static int copy_scratchpad(struct w1_slave *sl)
 	if (!sl->family_data) 
 		goto error;
 	
-	t_write = W1_THERM_EEPROM_WRITE_DELAY; // TODO change that define to func
+	t_write = W1_THERM_EEPROM_WRITE_DELAY;
 	strong_pullup = (w1_strong_pullup == 2 ||
 					(!SLAVE_POWERMODE(sl) && w1_strong_pullup));
 
@@ -1020,7 +1023,7 @@ static ssize_t w1_slave_store(struct device *device,
 		return size;	/* return size to avoid calling back again the callback*/
 	}
 
-	if ( (!sl->family_data) || (!device_family(sl)) ){
+	if ( (!sl->family_data) || (!SLAVE_SPECIFIC_FUNC(sl)) ){
 		dev_info(device,
 			"%s: Device not supported by the driver\n", __func__);
 		return size;  /* No device family */
@@ -1029,7 +1032,10 @@ static ssize_t w1_slave_store(struct device *device,
 	if (val == 0)	/* val=0 : trigger a EEPROM save */
 		ret = copy_scratchpad(sl);
 	else
-		ret = device_family(sl)->set_resolution(sl, val);
+	{
+		if(SLAVE_SPECIFIC_FUNC(sl)->set_resolution)
+			ret = SLAVE_SPECIFIC_FUNC(sl)->set_resolution(sl, val);
+	}
 	
 	if (ret){
 		dev_info(device, 
@@ -1049,7 +1055,7 @@ static ssize_t temperature_show(struct device *device,
 	struct therm_info info;
 	int ret = 0;
 
-	if ( (!sl->family_data) || (!device_family(sl)) ){
+	if ( (!sl->family_data) || (!SLAVE_SPECIFIC_FUNC(sl)) ){
 		dev_info(device,
 			"%s: Device not supported by the driver\n", __func__);
 		return 0;  /* No device family */
@@ -1108,14 +1114,14 @@ static ssize_t resolution_show(struct device *device,
 {
 	struct w1_slave *sl = dev_to_w1_slave(device);
 
-	if ( (!sl->family_data) || (!device_family(sl)) ){
+	if ( (!sl->family_data) || (!SLAVE_SPECIFIC_FUNC(sl)) ){
 		dev_info(device,
 			"%s: Device not supported by the driver\n", __func__);
 		return 0;  /* No device family */
 	}
 	
 	/* get the correct function depending on the device */
-	SLAVE_RESOLUTION(sl) = device_family(sl)->get_resolution(sl);
+	SLAVE_RESOLUTION(sl) = SLAVE_SPECIFIC_FUNC(sl)->get_resolution(sl);
 	if (SLAVE_RESOLUTION(sl)<0){
 		dev_dbg(device,
 			"%s: Resolution may be corrupted. err=%d\n",
@@ -1140,7 +1146,7 @@ static ssize_t resolution_store(struct device *device,
 		return size;	/* return size to avoid calling back again the callback*/
 	}
 
-	if ( (!sl->family_data) || (!device_family(sl)) ){
+	if ( (!sl->family_data) || (!SLAVE_SPECIFIC_FUNC(sl)) ){
 		dev_info(device,
 			"%s: Device not supported by the driver\n", __func__);
 		return size;  /* No device family */
@@ -1150,7 +1156,7 @@ static ssize_t resolution_store(struct device *device,
 		only device knows what is correct or not */
 
 	/* get the correct function depending on the device */
-	ret = device_family(sl)->set_resolution(sl, val);
+	ret = SLAVE_SPECIFIC_FUNC(sl)->set_resolution(sl, val);
 
 	if (ret){
 		dev_info(device, 
@@ -1182,7 +1188,6 @@ static ssize_t eeprom_store(struct device *device,
 
 	return size;
 }
-//////////////////////////////////////////////////////////////////////////////////////////
 
 static ssize_t alarms_show(struct device *device,
 	struct device_attribute *attr, char *buf)
@@ -1204,11 +1209,11 @@ static ssize_t alarms_show(struct device *device,
 
 	return sprintf(buf, "%hd %hd\n", tl, th);
 }
+
 static ssize_t alarms_store(struct device *device,
 	struct device_attribute *attr, const char *buf, size_t size)
 {
 	struct w1_slave *sl = dev_to_w1_slave(device);
-	struct w1_therm_family_converter *sl_fam_conv=NULL;
 	struct therm_info info;
 	u8 new_config_register[3];	/* array of data to be written */
 	int temp, ret = -EINVAL;
@@ -1218,8 +1223,7 @@ static ssize_t alarms_store(struct device *device,
 	
 
 	/* Safe string copys as buf is const */
-	if(!p_args)
-	{
+	if(!p_args) {
 		dev_warn(device, "%s: error unable to allocate memory %d\n", __func__, -ENOMEM);
 		return size;
 	}
@@ -1228,16 +1232,14 @@ static ssize_t alarms_store(struct device *device,
 	/* Split string using space char */
 	token = strsep(&p_args, " ");
 
-	if (!token)
-	{
+	if (!token)	{
 		dev_info(device, "%s: error parsing args %d\n", __func__, -EINVAL);
 		goto free_m;
 	}
 
 	/* Convert 1st entry to int */
 	ret = kstrtoint (token,10, &temp);
-	if (ret)
-	{
+	if (ret) {
 		dev_info(device, "%s: error parsing args %d\n", __func__, ret);
 		goto free_m;
 	}
@@ -1246,15 +1248,13 @@ static ssize_t alarms_store(struct device *device,
 
 	/* Split string using space char */
   	token = strsep(&p_args, " ");
-	if (!token)
-	{
+	if (!token)	{
 		dev_info(device, "%s: error parsing args %d\n", __func__, -EINVAL);
 		goto free_m;
 	}
 	/* Convert 2nd entry to int */
 	ret = kstrtoint (token,10, &temp);
-	if (ret)
-	{
+	if (ret) {
 		dev_info(device, "%s: error parsing args %d\n", __func__, ret);
 		goto free_m;
 	}
@@ -1273,22 +1273,18 @@ static ssize_t alarms_store(struct device *device,
 		new_config_register[0] = th;	// Byte 2
 		new_config_register[1] = tl;	// Byte 3
 		new_config_register[2] = info.rom[4];// Byte 4
-	}
-	else
-	{
+	} else {
 		dev_info(device, "%s: error reading from the slave device %d\n", __func__, ret);
 		goto free_m;
 	}
 
 	/* Write data in the device RAM */
-	sl_fam_conv = device_family(sl);
-	if(!sl_fam_conv)
-	{
+	if(!SLAVE_SPECIFIC_FUNC(sl)) {
 		dev_info(device, "%s: Device not supported by the driver %d\n", __func__, -ENODEV);
 		goto free_m;
 	}
 
-	ret = sl_fam_conv->write_data(sl, new_config_register);
+	ret = SLAVE_SPECIFIC_FUNC(sl)->write_data(sl, new_config_register);
 	if (ret)
 		dev_info(device, "%s: error writing to the slave device %d\n", __func__, ret);
 
