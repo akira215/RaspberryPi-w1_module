@@ -98,6 +98,8 @@ The sysfs interface of the module is :
   * *caveat* : if a bulk read is sent but one sensor is not read immediately,
   			the next access to temperature will return the temperature measured 
   			at the time of issue of the bulk read command (not the current temperature)
+			
+  * *limitation* : up to now in multi w1_master - systems "therm_bulk_read" is only available for the first w1_master
   
 
 ## Example of use
